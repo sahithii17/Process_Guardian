@@ -3,15 +3,21 @@ from collections import defaultdict, deque
 
 
 class Guardian:
-    """Behavior-focused heuristic engine. Alerts are not malware classifications."""
 
     def __init__(self, monitor):
+
         self.monitor = monitor
-        self.alert_log = deque(maxlen=150)
-        self.cpu_since = {}
-        self.samples = defaultdict(lambda: deque(maxlen=12))
-        self.last_process_count = None
-        self.last_spike_time = 0.0
+
+        self.alert_log = deque(maxlen=200)
+
+        self.cpu_high_since = {}
+
+        self.samples = defaultdict(
+            lambda: deque(maxlen=60)
+        )
+
+        self.process_counts = deque(maxlen=30)
+
         self.rules = {
             "high_cpu": 80,
             "high_cpu_seconds": 10,
@@ -19,114 +25,322 @@ class Guardian:
             "critical_cpu": 90,
             "critical_memory_mb": 1024,
             "spawn_spike": 8,
+            "thread_spike": 100,
+            "behavior_deviation": 2.0,
         }
 
-    def _add(self, severity, title, pid=None, detail="", category="behavior"):
-        now = time.time()
-        key = (pid, title)
-        for item in self.alert_log:
-            if item["key"] == key and now - item["timestamp_epoch"] < 15:
-                return
-        self.alert_log.appendleft({
-            "key": key,
-            "timestamp_epoch": now,
-            "time": time.strftime("%H:%M:%S"),
+    # ---------------------------------------------------------
+    # Alerts
+    # ---------------------------------------------------------
+
+    def add_alert(
+        self,
+        severity,
+        title,
+        message,
+        pid=None,
+        process=None,
+    ):
+
+        alert = {
+            "id": f"{time.time_ns()}",
+            "timestamp": time.time(),
             "severity": severity,
             "title": title,
+            "message": message,
             "pid": pid,
-            "detail": detail,
-            "category": category,
-        })
+            "process": process,
+        }
+
+        self.alert_log.appendleft(alert)
 
     def scan(self, processes):
+
         now = time.time()
-        current_count = len(processes)
-        if self.last_process_count is not None:
-            delta = current_count - self.last_process_count
-            if delta >= self.rules["spawn_spike"] and now - self.last_spike_time > 15:
-                self._add("warning", "Process creation spike", detail=f"{delta} net new processes appeared between samples.", category="lifecycle")
-                self.last_spike_time = now
-        self.last_process_count = current_count
 
-        current_keys = set()
-        for p in processes:
-            key = p["identity"]
-            current_keys.add(key)
-            cpu = p["cpu"]
-            mem = p["memory_mb"]
-            samples = self.samples[key]
-            samples.append({"cpu": cpu, "memory": mem, "threads": p["threads"], "time": now, "pid": p["pid"], "name": p["name"]})
+        self.process_counts.append(len(processes))
 
+        for process in processes:
+
+            pid = process["pid"]
+            name = process["name"]
+
+            cpu = float(process.get("cpu", 0))
+            memory = float(process.get("memory_mb", 0))
+            threads = int(process.get("threads", 0))
+
+            sample = self.samples[pid]
+
+            sample.append({
+                "cpu": cpu,
+                "memory_mb": memory,
+                "threads": threads,
+                "timestamp": now,
+            })
+
+            # Sustained CPU
             if cpu >= self.rules["high_cpu"]:
-                self.cpu_since.setdefault(key, now)
-                duration = now - self.cpu_since[key]
+
+                if pid not in self.cpu_high_since:
+                    self.cpu_high_since[pid] = now
+
+                duration = now - self.cpu_high_since[pid]
+
                 if duration >= self.rules["high_cpu_seconds"]:
-                    self._add("warning", "Sustained high CPU", p["pid"], f"{p['name']} stayed above {self.rules['high_cpu']}% CPU for about {int(duration)}s.")
+
+                    self.add_alert(
+                        "warning",
+                        "Sustained high CPU",
+                        (
+                            f"{name} has remained above "
+                            f"{self.rules['high_cpu']}% CPU."
+                        ),
+                        pid,
+                        name,
+                    )
+
             else:
-                self.cpu_since.pop(key, None)
+                self.cpu_high_since.pop(pid, None)
 
-            if mem >= self.rules["high_memory_mb"]:
-                self._add("warning", "High memory usage", p["pid"], f"{p['name']} is using {mem:.0f} MB of RAM.")
+            # High memory
+            if memory >= self.rules["high_memory_mb"]:
 
-            if cpu >= self.rules["critical_cpu"] and mem >= self.rules["critical_memory_mb"]:
-                self._add("critical", "Critical resource usage", p["pid"], f"{p['name']} is using {cpu}% CPU and {mem:.0f} MB RAM.")
+                self.add_alert(
+                    "warning",
+                    "High memory usage",
+                    (
+                        f"{name} is using "
+                        f"{memory:.0f} MB of memory."
+                    ),
+                    pid,
+                    name,
+                )
 
-            if len(samples) >= 4:
-                baseline = list(samples)[:-1]
-                avg_cpu = sum(x["cpu"] for x in baseline) / len(baseline)
-                avg_mem = sum(x["memory"] for x in baseline) / len(baseline)
-                if avg_cpu >= 1 and cpu > max(70, avg_cpu * 3):
-                    self._add("warning", "CPU behavior deviation", p["pid"], f"Current CPU {cpu}% is far above this process's recent baseline of {avg_cpu:.1f}%.", category="baseline")
-                if avg_mem >= 20 and mem > max(300, avg_mem * 2.5):
-                    self._add("warning", "Memory behavior deviation", p["pid"], f"Current memory {mem:.0f} MB is far above its recent baseline of {avg_mem:.0f} MB.", category="baseline")
-                if len(baseline) >= 3:
-                    previous_threads = baseline[-1]["threads"]
-                    if p["threads"] >= max(50, previous_threads + 40):
-                        self._add("warning", "Thread-count spike", p["pid"], f"Thread count rose from {previous_threads} to {p['threads']}.", category="behavior")
+            # Critical
+            if (
+                cpu >= self.rules["critical_cpu"]
+                and
+                memory >= self.rules["critical_memory_mb"]
+            ):
 
-        for key in list(self.samples):
-            if key not in current_keys:
-                self.samples.pop(key, None)
-                self.cpu_since.pop(key, None)
+                self.add_alert(
+                    "critical",
+                    "Critical resource usage",
+                    (
+                        f"{name} is using "
+                        f"{cpu:.0f}% CPU and "
+                        f"{memory:.0f} MB memory."
+                    ),
+                    pid,
+                    name,
+                )
+
+            # Thread spike
+            if threads >= self.rules["thread_spike"]:
+
+                self.add_alert(
+                    "info",
+                    "Large thread count",
+                    (
+                        f"{name} currently has "
+                        f"{threads} threads."
+                    ),
+                    pid,
+                    name,
+                )
+
+    # ---------------------------------------------------------
+    # Alerts API
+    # ---------------------------------------------------------
 
     def alerts(self):
         return list(self.alert_log)
 
+    # ---------------------------------------------------------
+    # Baseline
+    # ---------------------------------------------------------
+
     def baseline(self, pid):
-        matches = []
-        for key, samples in self.samples.items():
-            if samples and samples[-1]["pid"] == pid:
-                matches = list(samples)
-                break
-        if len(matches) < 2:
-            return {"ready": False, "message": "Collecting more samples for this process...", "samples": len(matches)}
+
+        samples = list(self.samples.get(pid, []))
+
+        if not samples:
+
+            return {
+                "pid": pid,
+                "samples": 0,
+                "avg_cpu": 0,
+                "peak_cpu": 0,
+                "avg_memory_mb": 0,
+                "peak_memory_mb": 0,
+                "avg_threads": 0,
+                "peak_threads": 0,
+            }
+
+        cpu_values = [
+            item["cpu"]
+            for item in samples
+        ]
+
+        memory_values = [
+            item["memory_mb"]
+            for item in samples
+        ]
+
+        thread_values = [
+            item["threads"]
+            for item in samples
+        ]
+
         return {
-            "ready": len(matches) >= 4,
-            "samples": len(matches),
-            "cpu_avg": round(sum(x["cpu"] for x in matches) / len(matches), 1),
-            "memory_avg_mb": round(sum(x["memory"] for x in matches) / len(matches), 1),
-            "threads_avg": round(sum(x["threads"] for x in matches) / len(matches), 1),
-            "cpu_peak": round(max(x["cpu"] for x in matches), 1),
-            "memory_peak_mb": round(max(x["memory"] for x in matches), 1),
+            "pid": pid,
+            "samples": len(samples),
+
+            "avg_cpu": round(
+                sum(cpu_values) / len(cpu_values),
+                2,
+            ),
+
+            "peak_cpu": round(
+                max(cpu_values),
+                2,
+            ),
+
+            "avg_memory_mb": round(
+                sum(memory_values) / len(memory_values),
+                2,
+            ),
+
+            "peak_memory_mb": round(
+                max(memory_values),
+                2,
+            ),
+
+            "avg_threads": round(
+                sum(thread_values) / len(thread_values),
+                2,
+            ),
+
+            "peak_threads": max(thread_values),
         }
 
+    # ---------------------------------------------------------
+    # Diagnosis
+    # ---------------------------------------------------------
+
     def diagnose(self, processes, system):
-        top_cpu = sorted(processes, key=lambda x: x["cpu"], reverse=True)[:5]
-        top_mem = sorted(processes, key=lambda x: x["memory_mb"], reverse=True)[:5]
+
         reasons = []
-        if system["cpu"] >= 80:
-            reasons.append(f"System CPU is high at {system['cpu']}%.")
-        if system["memory"] >= 80:
-            reasons.append(f"System memory utilization is high at {system['memory']}%.")
-        for p in top_cpu[:3]:
-            if p["cpu"] >= 50:
-                reasons.append(f"{p['name']} (PID {p['pid']}) is using {p['cpu']}% CPU.")
-        for p in top_mem[:3]:
-            if p["memory_mb"] >= 500:
-                reasons.append(f"{p['name']} (PID {p['pid']}) is using {p['memory_mb']:.0f} MB RAM.")
+        recommendations = []
+
+        cpu = float(system.get("cpu", 0))
+        memory = float(system.get("memory", 0))
+
+        # System CPU
+        if cpu >= 80:
+
+            top_cpu = sorted(
+                processes,
+                key=lambda p: p.get("cpu", 0),
+                reverse=True,
+            )[:5]
+
+            reasons.append({
+                "type": "cpu",
+                "severity": "warning",
+                "title": "High system CPU usage",
+                "message": (
+                    f"Overall CPU utilization is "
+                    f"{cpu:.1f}%."
+                ),
+                "processes": [
+                    {
+                        "pid": p["pid"],
+                        "name": p["name"],
+                        "cpu": p["cpu"],
+                    }
+                    for p in top_cpu
+                ],
+            })
+
+            recommendations.append(
+                "Inspect the highest CPU processes in the Processes tab."
+            )
+
+        # System memory
+        if memory >= 80:
+
+            top_memory = sorted(
+                processes,
+                key=lambda p: p.get("memory_mb", 0),
+                reverse=True,
+            )[:5]
+
+            reasons.append({
+                "type": "memory",
+                "severity": "warning",
+                "title": "High system memory usage",
+                "message": (
+                    f"Overall memory utilization is "
+                    f"{memory:.1f}%."
+                ),
+                "processes": [
+                    {
+                        "pid": p["pid"],
+                        "name": p["name"],
+                        "memory_mb": p["memory_mb"],
+                    }
+                    for p in top_memory
+                ],
+            })
+
+            recommendations.append(
+                "Inspect processes with the largest memory footprint."
+            )
+
+        # Top CPU contributor
+        if processes:
+
+            top = max(
+                processes,
+                key=lambda p: p.get("cpu", 0),
+            )
+
+            if top.get("cpu", 0) >= 50:
+
+                reasons.append({
+                    "type": "process",
+                    "severity": "info",
+                    "title": "Main CPU contributor",
+                    "message": (
+                        f"{top['name']} (PID {top['pid']}) "
+                        f"is currently using "
+                        f"{top['cpu']:.1f}% CPU."
+                    ),
+                    "pid": top["pid"],
+                })
 
         if not reasons:
-            summary = "No strong resource-pressure signal was detected in the current sample."
-        else:
-            summary = "The current slowdown indicators are driven mainly by the processes listed below."
-        return {"summary": summary, "reasons": reasons, "top_cpu": top_cpu, "top_memory": top_mem, "generated_at": time.strftime("%H:%M:%S")}
+
+            reasons.append({
+                "type": "healthy",
+                "severity": "normal",
+                "title": "No major resource pressure detected",
+                "message": (
+                    "Current CPU and memory utilization "
+                    "are within the configured thresholds."
+                ),
+            })
+
+        return {
+            "timestamp": time.time(),
+            "summary": (
+                "System appears healthy."
+                if len(reasons) == 1
+                and reasons[0]["type"] == "healthy"
+                else "Potential resource pressure detected."
+            ),
+            "reasons": reasons,
+            "recommendations": recommendations,
+            "system": system,
+        }

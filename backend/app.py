@@ -1,12 +1,16 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
 
+from agent_config import HOST, PORT, agent_info, data_dir
+from lifecycle_store import LifecycleStore
 from process_monitor import ProcessMonitor
 from guardian import Guardian
 
 app = Flask(__name__)
-CORS(app)
-monitor = ProcessMonitor()
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+store = LifecycleStore(data_dir() / "lifecycle.json")
+monitor = ProcessMonitor(store)
 guardian = Guardian(monitor)
 
 
@@ -20,6 +24,11 @@ def collect():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "Process Guardian", "platform": system_platform()})
+
+
+@app.get("/api/agent")
+def agent():
+    return jsonify(agent_info())
 
 
 def system_platform():
@@ -52,6 +61,14 @@ def process_tree(pid):
     data = monitor.process_tree(pid)
     if data is None:
         return jsonify({"error": "Process not found or access was denied."}), 404
+    return jsonify(data)
+
+
+@app.get("/api/processes/<int:pid>/termination-check")
+def termination_check(pid):
+    data = monitor.termination_check(pid)
+    if not data.get("ok"):
+        return jsonify(data), 404
     return jsonify(data)
 
 
@@ -106,4 +123,4 @@ def demo_cpu_stop():
 
 if __name__ == "__main__":
     print("Process Guardian API listening on http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
